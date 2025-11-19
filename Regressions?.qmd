@@ -439,7 +439,7 @@ ggplot(trust_results, aes(x = trust_var, y = d_pr2)) +
     title = "Which trust items add the most explanatory power?"
   ) +
   theme_minimal()
-
+#shift share analysis
 
 ```
 jdanfldhjfa;kdj
