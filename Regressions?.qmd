@@ -1,0 +1,209 @@
+---
+title: "Playing with the Population Data"
+date: 11/19/2025
+format: html
+editor: visual
+---
+#libraries
+```{r}
+library(terra)
+library(rnaturalearth)
+library(dplyr)
+library(viridisLite)
+library(fixest)
+library(tidyverse) 
+library(sf) 
+library(here) 
+library(stars) 
+library(tmap) 
+library(viridis) 
+library(readr)
+library(dplyr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(lubridate)
+library(terra)
+library(exactextractr)
+library(readr)
+library(haven)
+library(sf)
+library(units)
+```
+
+#reading it in
+```{r}
+ab <- read_sav("R9Geo.sav")
+glbl <- rast("Popdata/Global.tif")
+acled <- sf::st_read(here::here("ACLED.csv")) #its giving a warning that it's not spatial, thats ok i know
+names(acled)[grep("lat|lon|long", names(acled), ignore.case = TRUE)]
+
+lat_col <- "latitude"
+lon_col <- "longitude"
+acled <- acled %>%
+  mutate(
+    !!lat_col := as.numeric(.data[[lat_col]]),
+    !!lon_col := as.numeric(.data[[lon_col]])
+  ) %>%
+  filter(!is.na(.data[[lat_col]]), !is.na(.data[[lon_col]]),
+         between(.data[[lat_col]], -90, 90),
+         between(.data[[lon_col]], -180, 180))
+acled_sf <- st_as_sf(acled, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
+```
+#Cropping to WA
+```{r}
+africa <- ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
+# 3. Filter for your West African countries
+wa_countries <- africa %>%
+  dplyr::filter(admin %in% c(
+    "Benin", "Burkina Faso", "Cabo Verde", "Ivory Coast",
+    "Gambia", "Ghana", "Guinea", "Guinea Bissau", "Liberia", "Mali", "Mauritania", "Niger",
+    "Nigeria", "Senegal", "Sierra Leone", "Togo"
+  ))
+wa_v <- vect(wa_countries)
+
+# 5. Crop and mask the raster
+glbl_wa <- crop(glbl, wa_v)
+glbl_wa <- mask(glbl_wa, wa_v)
+
+# 6. Plot result
+plot(glbl_wa)
+```
+
+#configuring for regressions
+```{r}
+guess_coord <- function(df){
+  nms <- names(df)
+  lon_guess <- nms[grep("EA_GPS_LA", nms, ignore.case = TRUE)][1]
+  lat_guess <- nms[grep("EA_GPS_LO", nms, ignore.case = TRUE)][1]
+  stopifnot(!is.na(lon_guess), !is.na(lat_guess))
+  list(lon = lon_guess, lat = lat_guess)
+}
+xy <- guess_coord(ab)
+names(ab)
+
+ab_sf <- ab %>%
+  mutate(
+    !!xy$lon := as.numeric(.data[[xy$lon]]),
+    !!xy$lat := as.numeric(.data[[xy$lat]])
+  ) %>%
+  filter(
+    between(.data[[xy$lat]], -90, 90),
+    between(.data[[xy$lon]], -180, 180)
+  ) %>%
+  st_as_sf(coords = c(xy$lon, xy$lat), crs = 4326, remove = FALSE)
+```
+population density
+```{r}
+# --------------------------------------
+# 3) Population density at respondent
+#     (convert counts -> per km²)
+# --------------------------------------
+# If Global.tif is population *counts per cell*, convert to density:
+cell_km2 <- terra::cellSize(glbl, unit = "km")
+pop_dens <- glbl / cell_km2   # persons per km²
+
+# Extract density for each AB point
+# terra::extract() works with sf; returns a data.frame with ID + values
+ab_sf$pop_density <- terra::extract(pop_dens, ab_sf)[, 2]
+
+# Optional: cap huge outliers & log-scale for stability
+ab_sf <- ab_sf %>%
+  mutate(pop_density_log = log1p(pmin(pop_density, quantile(pop_density, 0.99, na.rm = TRUE))))
+
+dist_25km <- set_units(25, km)
+
+within_25km <- st_is_within_distance(
+  ab_sf,
+  acled_sf,
+  dist = dist_25km
+)
+
+within_25km <- st_is_within_distance(ab_sf, acled_sf, dist = set_units(25, "km"))
+conflict_counts <- lengths(within_25km)
+
+ab_sf <- ab_sf %>%
+  mutate(
+    conflict_count     = conflict_counts,
+    conflict_presence  = conflict_counts > 0
+  )
+
+```
+actually working with the questions
+```{r}
+# -------------------------------------------------------
+# 5) Build a 0–3 trust scale from labelled AB variables
+#    (tries common columns; replace candidate list if needed)
+# -------------------------------------------------------
+make_trust_0_3 <- function(x){
+  # Works for labelled or character/numeric, maps to 0..3
+  x <- tryCatch(haven::as_factor(x), error = function(e) x)
+  x_chr <- as.character(x)
+  out <- dplyr::case_when(
+    grepl("not at all|none|no trust|pas du tout|nada", x_chr, ignore.case = TRUE) ~ 0,
+    grepl("just a little|a little|un peu|poco", x_chr, ignore.case = TRUE)        ~ 1,
+    grepl("some|somewhat|assez|algo", x_chr, ignore.case = TRUE)                  ~ 2,
+    grepl("a lot|great deal|beaucoup|mucho|high", x_chr, ignore.case = TRUE)      ~ 3,
+    suppressWarnings(!is.na(as.numeric(x_chr)))                                   ~ pmin(pmax(as.numeric(x_chr), 0), 3),
+    TRUE ~ NA_real_
+  )
+  as.numeric(out)
+}
+```
+Regressions
+```{r}
+# Try likely trust columns (edit order if you know the exact var)
+trust_candidates <- c("Q37D", "Q86F", "trust_local", "trust_gov", "trust_in_institutions")
+trust_col <- trust_candidates[trust_candidates %in% names(ab_sf)][1]
+if (is.na(trust_col)) stop("Couldn't find a trust variable. Add its name to 'trust_candidates'.")
+
+ab_sf$trust_0_3 <- make_trust_0_3(ab_sf[[trust_col]])
+
+# Optional: controls if present (age/education/urban)
+ctrls <- intersect(c("age", "education", "urban", "female", "income", "religiosity"), names(ab_sf))
+# Country/region FEs if present
+fe_country <- intersect(c("country", "country_name", "COUNTRY"), names(ab_sf))[1]
+fe_region  <- intersect(c("region", "region_name", "ADM1NAME"), names(ab_sf))[1]
+
+# --------------------------------------
+# 6) Estimation
+#    (a) Binary DV: any conflict nearby → Logit with FEs
+#    (b) Count DV: number of events → Poisson/NegBin
+# --------------------------------------
+
+# (a) Logit: Conflict presence
+f_logit <- as.formula(paste0(
+  "conflict_presence ~ trust_0_3 + pop_density_log",
+  if (length(ctrls)) paste0(" + ", paste(ctrls, collapse = " + ")) else "",
+  if (!is.na(fe_region)) paste0(" | ", fe_country %||% "", if (!is.na(fe_country) && !is.na(fe_region)) " + " else "", fe_region %||% "") 
+  else if (!is.na(fe_country)) paste0(" | ", fe_country) else ""
+))
+# Note: %||% helper
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+
+m_logit <- feglm(
+  f_logit,
+  data   = ab_sf,
+  family = "binomial"
+)
+
+# Cluster-robust SEs (cluster by country if available)
+if (!is.na(fe_country)) {
+  summary(m_logit, cluster = fe_country)
+} else {
+  summary(m_logit, cluster = ~1)
+}
+
+# (b) Poisson: Conflict counts (use NB if overdispersed)
+f_pois <- update(f_logit, conflict_count ~ .)
+m_pois <- feglm(f_pois, data = ab_sf, family = "poisson")
+if (!is.na(fe_country)) {
+  print(summary(m_pois, cluster = fe_country))
+} else {
+  print(summary(m_pois, cluster = ~ 1))
+}
+
+# If overdispersion is obvious, switch to NegBin via fixest::fenegbin
+#(requires fixest >= 0.11.2)
+# m_nb <- fenegbin(f_pois, data = ab_sf)
+# print(summary(m_nb, cluster = fe_country))
+```
