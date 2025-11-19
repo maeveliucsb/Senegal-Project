@@ -130,80 +130,316 @@ ab_sf <- ab_sf %>%
 ```
 actually working with the questions
 ```{r}
-# -------------------------------------------------------
-# 5) Build a 0–3 trust scale from labelled AB variables
-#    (tries common columns; replace candidate list if needed)
-# -------------------------------------------------------
-make_trust_0_3 <- function(x){
-  # Works for labelled or character/numeric, maps to 0..3
-  x <- tryCatch(haven::as_factor(x), error = function(e) x)
-  x_chr <- as.character(x)
-  out <- dplyr::case_when(
-    grepl("not at all|none|no trust|pas du tout|nada", x_chr, ignore.case = TRUE) ~ 0,
-    grepl("just a little|a little|un peu|poco", x_chr, ignore.case = TRUE)        ~ 1,
-    grepl("some|somewhat|assez|algo", x_chr, ignore.case = TRUE)                  ~ 2,
-    grepl("a lot|great deal|beaucoup|mucho|high", x_chr, ignore.case = TRUE)      ~ 3,
-    suppressWarnings(!is.na(as.numeric(x_chr)))                                   ~ pmin(pmax(as.numeric(x_chr), 0), 3),
-    TRUE ~ NA_real_
-  )
-  as.numeric(out)
-}
-```
-Regressions
-```{r}
-# Try likely trust columns (edit order if you know the exact var)
-trust_candidates <- c("Q37D", "Q86F", "trust_local", "trust_gov", "trust_in_institutions")
-trust_col <- trust_candidates[trust_candidates %in% names(ab_sf)][1]
-if (is.na(trust_col)) stop("Couldn't find a trust variable. Add its name to 'trust_candidates'.")
+q37j_raw <- ab$Q37J
 
-ab_sf$trust_0_3 <- make_trust_0_3(ab_sf[[trust_col]])
+# Drop special missing codes
+bad_codes <- c(8, 9, -1)
+q37j_raw[q37j_raw %in% bad_codes] <- NA
+
+# Now this is already 0–3
+trust_trad_leaders <- q37j_raw
+
+q37j_raw <- ab$Q37J
+q37j_raw[q37j_raw %in% c(8, 9, -1)] <- NA
+trust_trad_leaders <- make_trust_0_3(q37j_raw)
+
+```
+Mkaing an index
+```{r}
+#creating an index
+trust_candidates <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37B', 'Q37D', 'Q37K', 'Q37I')
+trust_corrpution <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37B', 'Q37D', 'Q37K', 'Q37I', "Q38D", "Q38E", "Q38F", "Q38G", "Q38H")
+trust_cols <- trust_candidates[trust_candidates %in% names(ab_sf)]
+if (length(trust_cols) == 0) {
+  stop("Couldn't find any trust variables. Add their names to 'trust_candidates'.")
+}
+
+ab_sf <- ab_sf %>%
+  mutate(
+    across(
+      all_of(trust_cols),
+      make_trust_0_3,
+      .names = "{.col}_0_3"
+    )
+  )
+trust_corr <- trust_corrpution[trust_corrpution %in% names(ab_sf)]
+if (length(trust_corr) == 0) {
+  stop("Couldn't find any trust variables. Add their names to 'trust_candidates'.")
+}
+ab_sf <- ab_sf %>%
+  mutate(
+    across(
+      all_of(trust_cols),
+      make_trust_0_3,
+      .names = "{.col}_0_3"
+    )
+  )
+
+ab_sf <- ab_sf %>%
+  mutate(
+    across(
+      all_of(trust_corr),
+      make_trust_0_3,
+      .names = "{.col}_0_3"
+    )
+  )
+
+trust_index_cols <- paste0(trust_cols, "_0_3")
+trust_index_cor <- paste0(trust_corr, "_0_3")
+ab_sf <- ab_sf %>%
+  rowwise() %>%
+  mutate(
+    trust_index = if_else(
+      # require at least 2 non-missing items (you can change this)
+      sum(!is.na(c_across(all_of(trust_index_cols)))) >= 2,
+      mean(c_across(all_of(trust_index_cols)), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+ab_sf <- ab_sf %>%
+  rowwise() %>%
+  mutate(
+    trust_index = if_else(
+      sum(!is.na(c_across(all_of(trust_index_cor)))) >= 2,
+      mean(c_across(all_of(trust_index_cor)), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
 
 # Optional: controls if present (age/education/urban)
-ctrls <- intersect(c("age", "education", "urban", "female", "income", "religiosity"), names(ab_sf))
+ctrls <- intersect(c("Q1", "Q2", "URBRUR", "Q100", "Q94", "Q95"), names(ab_sf))
 # Country/region FEs if present
 fe_country <- intersect(c("country", "country_name", "COUNTRY"), names(ab_sf))[1]
 fe_region  <- intersect(c("region", "region_name", "ADM1NAME"), names(ab_sf))[1]
 
-# --------------------------------------
-# 6) Estimation
-#    (a) Binary DV: any conflict nearby → Logit with FEs
-#    (b) Count DV: number of events → Poisson/NegBin
-# --------------------------------------
 
-# (a) Logit: Conflict presence
-f_logit <- as.formula(paste0(
-  "conflict_presence ~ trust_0_3 + pop_density_log",
-  if (length(ctrls)) paste0(" + ", paste(ctrls, collapse = " + ")) else "",
-  if (!is.na(fe_region)) paste0(" | ", fe_country %||% "", if (!is.na(fe_country) && !is.na(fe_region)) " + " else "", fe_region %||% "") 
-  else if (!is.na(fe_country)) paste0(" | ", fe_country) else ""
-))
-# Note: %||% helper
-`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nzchar(a)) a else b
+```
+
+```{r}
+density_var <- if ("pop_density" %in% names(ab_sf)) {
+  "pop_density"
+} else if ("pop_density_log" %in% names(ab_sf)) {
+  "pop_density_log"
+} else {
+  stop("No population density variable found (pop_density or pop_density_log).")
+}
+
+
+# main regressors: trust + density + other controls
+rhs_vars <- c("trust_index", density_var, ctrls)
+
+# collapse into a single RHS string: e.g. "trust_index + pop_density + Q1 + Q2 + URBRUR + ..."
+rhs_str <- paste(rhs_vars, collapse = " + ")
+
+# Start with the basic part: DV ~ regressors
+base_str <- paste0("conflict_presence ~ ", rhs_str)
+
+# Build FE part depending on what exists
+fe_part <- NULL
+
+if (!is.na(fe_country) && !is.na(fe_region)) {
+  fe_part <- paste(fe_country, fe_region, sep = " + ")
+} else if (!is.na(fe_region)) {
+  fe_part <- fe_region
+} else if (!is.na(fe_country)) {
+  fe_part <- fe_country
+}
+
+# Combine into final formula string
+if (!is.null(fe_part)) {
+  # fixest syntax: y ~ x1 + x2 | fe1 + fe2
+  f_str <- paste(base_str, "|", fe_part)
+} else {
+  # no FEs available
+  f_str <- base_str
+}
+
+f_logit <- as.formula(f_str)
+f_logit
+
+
+
+```
+
+```{r}
+library(fixest)
 
 m_logit <- feglm(
-  f_logit,
+  fml    = f_logit,
   data   = ab_sf,
   family = "binomial"
 )
 
-# Cluster-robust SEs (cluster by country if available)
-if (!is.na(fe_country)) {
-  summary(m_logit, cluster = fe_country)
-} else {
-  summary(m_logit, cluster = ~1)
-}
+summary(m_logit)
 
-# (b) Poisson: Conflict counts (use NB if overdispersed)
-f_pois <- update(f_logit, conflict_count ~ .)
-m_pois <- feglm(f_pois, data = ab_sf, family = "poisson")
-if (!is.na(fe_country)) {
-  print(summary(m_pois, cluster = fe_country))
-} else {
-  print(summary(m_pois, cluster = ~ 1))
-}
-
-# If overdispersion is obvious, switch to NegBin via fixest::fenegbin
-#(requires fixest >= 0.11.2)
-# m_nb <- fenegbin(f_pois, data = ab_sf)
-# print(summary(m_nb, cluster = fe_country))
 ```
+
+# odds ratio
+```{r}
+library(broom)
+
+coef_df <- tidy(m_logit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    or   = exp(estimate),              # odds ratio
+    or_lo = exp(estimate - 1.96*std.error),
+    or_hi = exp(estimate + 1.96*std.error)
+  )
+
+ggplot(coef_df, aes(x = term, y = or)) +
+  geom_pointrange(aes(ymin = or_lo, ymax = or_hi)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Odds ratio (logit model)",
+    title = "Effect estimates from logit on conflict_presence"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+# 1) Get predicted probabilities from your logit
+# ab_pred <- ab_sf %>%
+#   st_drop_geometry() %>%                     # drop sf geometry
+#   mutate(phat = predict(m_logit, type = "response"))  # model-implied prob of conflict
+# 
+# # 2) Average those probabilities by trust_index
+# trust_curve <- ab_pred %>%
+#   filter(!is.na(trust_index)) %>%
+#   group_by(trust_index) %>%
+#   summarise(
+#     p_hat = mean(phat, na.rm = TRUE),
+#     n     = n(),
+#     # binomial SE for a mean proportion (simple, fine for plotting):
+#     se    = sqrt(p_hat * (1 - p_hat) / n),
+#     lower = p_hat - 1.96 * se,
+#     upper = p_hat + 1.96 * se,
+#     .groups = "drop"
+  )
+```
+
+```{r}
+
+# baseline RHS: density + other controls, no trust
+rhs_base   <- c(density_var, ctrls)
+rhs_base_s <- paste(rhs_base, collapse = " + ")
+base_str   <- paste0("conflict_presence ~ ", rhs_base_s)
+
+if (!is.null(fe_part)) {
+  base_f_str <- paste(base_str, "|", fe_part)
+} else {
+  base_f_str <- base_str
+}
+
+f_base <- as.formula(base_f_str)
+
+m_base <- feglm(
+  fml    = f_base,
+  data   = ab_sf,
+  family = "binomial"
+)
+
+base_pr2 <- as.numeric(fitstat(m_base, "pr2"))
+
+
+run_trust_model <- function(trust_var) {
+  # RHS: this trust var + density + other controls
+  rhs_vars <- c(trust_var, density_var, ctrls)
+  rhs_str  <- paste(rhs_vars, collapse = " + ")
+  
+  base_str <- paste0("conflict_presence ~ ", rhs_str)
+  
+  # add FEs if we have them
+  if (!is.null(fe_part)) {
+    f_str <- paste(base_str, "|", fe_part)
+  } else {
+    f_str <- base_str
+  }
+  
+  fml <- as.formula(f_str)
+  
+  m <- feglm(
+    fml    = fml,
+    data   = ab_sf,
+    family = "binomial"
+  )
+  
+  # coefficient + SE for THIS trust variable
+  b  <- coef(m)[trust_var]
+  se <- sqrt(vcov(m)[trust_var, trust_var])
+  z  <- b / se
+  p  <- 2 * pnorm(abs(z), lower.tail = FALSE)
+  
+  tibble(
+    trust_var = trust_var,
+    coef      = b,
+    se        = se,
+    z         = z,
+    p         = p,
+    or        = exp(b),
+    aic       = as.numeric(fitstat(m, "aic")),
+    bic       = as.numeric(fitstat(m, "bic")),
+    pr2       = as.numeric(fitstat(m, "pr2")),
+    d_pr2     = pr2 - base_pr2   # extra pseudo-R^2 beyond baseline model
+  )
+}
+
+trust_results <- map_dfr(trust_predictors, run_trust_model)
+
+# order by extra explanatory power
+trust_results %>%
+  arrange(desc(d_pr2))
+
+library(ggplot2)
+
+# nicer ordering: by extra pseudo-R^2
+trust_results <- trust_results %>%
+  mutate(trust_var = factor(trust_var, levels = trust_var[order(d_pr2)]))
+
+trust_results_labeled <- trust_results %>%
+  mutate(
+    trust_label = dplyr::recode(
+      trust_var,
+      "Q37J_0_3"   = "Traditional Leaders",
+      "Q37I_0_3"   = "Courts of Law",
+      "Q37G_0_3"   = "Police",
+      "Q37F_0_3"   = "Opposition Parties",
+      "Q37C_0_3"   = "Electoral Commission",
+      "trust_index" = "Trust index (all items)"
+    )
+  )
+
+# Odds-ratio plot across questions
+ggplot(trust_results_labeled, aes(x = trust_label, y = or)) +
+  geom_pointrange(aes(
+    ymin = exp(coef - 1.96 * se),
+    ymax = exp(coef + 1.96 * se)
+  )) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Odds ratio for conflict presence\n(one-unit increase in trust)",
+    title = "Trust question–by–question effects on conflict presence"
+  ) +
+  theme_minimal()
+
+
+ggplot(trust_results, aes(x = trust_var, y = d_pr2)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Δ pseudo-R² vs. baseline (no trust)",
+    title = "Which trust items add the most explanatory power?"
+  ) +
+  theme_minimal()
+
+
+```
+jdanfldhjfa;kdj
