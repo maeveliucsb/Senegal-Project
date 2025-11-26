@@ -4,8 +4,14 @@ date: 11/19/2025
 format: html
 editor: visual
 ---
+
 #libraries
+
 ```{r}
+
+#| message: false 
+#| warning: false 
+
 library(terra)
 library(rnaturalearth)
 library(dplyr)
@@ -28,10 +34,14 @@ library(readr)
 library(haven)
 library(sf)
 library(units)
+library(car)
 ```
 
 #reading it in
+
 ```{r}
+#| message: false 
+#| warning: false 
 ab <- read_sav("R9Geo.sav")
 glbl <- rast("Popdata/Global.tif")
 acled <- sf::st_read(here::here("ACLED.csv")) #its giving a warning that it's not spatial, thats ok i know
@@ -49,8 +59,21 @@ acled <- acled %>%
          between(.data[[lon_col]], -180, 180))
 acled_sf <- st_as_sf(acled, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
 ```
-#Cropping to WA
+
 ```{r}
+library(sf)
+
+# example: ab_sf
+st_bbox(ab_sf)      # xmin, ymin, xmax, ymax  (spatial extent)
+st_crs(ab_sf)       # coordinate reference system
+nrow(ab_sf)         # number of features (points/polygons)
+st_geometry_type(ab_sf)  # POINT / POLYGON / MULTIPOLYGON, etc.
+```
+#Cropping to WA
+
+```{r}
+#| message: false 
+#| warning: false 
 africa <- ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
 # 3. Filter for your West African countries
 wa_countries <- africa %>%
@@ -70,7 +93,10 @@ plot(glbl_wa)
 ```
 
 #configuring for regressions
+
 ```{r}
+#| message: false 
+#| warning: false 
 guess_coord <- function(df){
   nms <- names(df)
   lon_guess <- nms[grep("EA_GPS_LA", nms, ignore.case = TRUE)][1]
@@ -79,7 +105,7 @@ guess_coord <- function(df){
   list(lon = lon_guess, lat = lat_guess)
 }
 xy <- guess_coord(ab)
-names(ab)
+#names(ab)
 
 ab_sf <- ab %>%
   mutate(
@@ -91,9 +117,15 @@ ab_sf <- ab %>%
     between(.data[[xy$lon]], -180, 180)
   ) %>%
   st_as_sf(coords = c(xy$lon, xy$lat), crs = 4326, remove = FALSE)
+
+#n  = 53444
 ```
+
 population density
+
 ```{r}
+#| message: false 
+#| warning: false 
 # --------------------------------------
 # 3) Population density at respondent
 #     (convert counts -> per km²)
@@ -128,7 +160,9 @@ ab_sf <- ab_sf %>%
   )
 
 ```
+
 actually working with the questions
+
 ```{r}
 q37j_raw <- ab$Q37J
 
@@ -144,8 +178,12 @@ q37j_raw[q37j_raw %in% c(8, 9, -1)] <- NA
 trust_trad_leaders <- make_trust_0_3(q37j_raw)
 
 ```
+
 Mkaing an index
+
 ```{r}
+#| message: false 
+#| warning: false 
 #creating an index
 trust_candidates <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37B', 'Q37D', 'Q37K', 'Q37I')
 trust_corrpution <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37B', 'Q37D', 'Q37K', 'Q37I', "Q38D", "Q38E", "Q38F", "Q38G", "Q38H")
@@ -185,6 +223,7 @@ ab_sf <- ab_sf %>%
   )
 
 trust_index_cols <- paste0(trust_cols, "_0_3")
+
 trust_index_cor <- paste0(trust_corr, "_0_3")
 ab_sf <- ab_sf %>%
   rowwise() %>%
@@ -197,6 +236,7 @@ ab_sf <- ab_sf %>%
     )
   ) %>%
   ungroup()
+
 ab_sf <- ab_sf %>%
   rowwise() %>%
   mutate(
@@ -208,7 +248,7 @@ ab_sf <- ab_sf %>%
   ) %>%
   ungroup()
 
-# Optional: controls if present (age/education/urban)
+# controls
 ctrls <- intersect(c("Q1", "Q2", "URBRUR", "Q100", "Q94", "Q95"), names(ab_sf))
 # Country/region FEs if present
 fe_country <- intersect(c("country", "country_name", "COUNTRY"), names(ab_sf))[1]
@@ -218,6 +258,8 @@ fe_region  <- intersect(c("region", "region_name", "ADM1NAME"), names(ab_sf))[1]
 ```
 
 ```{r}
+#| message: false 
+#| warning: false 
 density_var <- if ("pop_density" %in% names(ab_sf)) {
   "pop_density"
 } else if ("pop_density_log" %in% names(ab_sf)) {
@@ -264,6 +306,8 @@ f_logit
 ```
 
 ```{r}
+#| message: false 
+#| warning: false 
 library(fixest)
 
 m_logit <- feglm(
@@ -277,7 +321,10 @@ summary(m_logit)
 ```
 
 # odds ratio
+
 ```{r}
+#| message: false 
+#| warning: false 
 library(broom)
 
 coef_df <- tidy(m_logit) %>%
@@ -302,28 +349,15 @@ ggplot(coef_df, aes(x = term, y = or)) +
 
 ```
 
+# Chi\^2 test
+
 ```{r}
-# 1) Get predicted probabilities from your logit
-# ab_pred <- ab_sf %>%
-#   st_drop_geometry() %>%                     # drop sf geometry
-#   mutate(phat = predict(m_logit, type = "response"))  # model-implied prob of conflict
-# 
-# # 2) Average those probabilities by trust_index
-# trust_curve <- ab_pred %>%
-#   filter(!is.na(trust_index)) %>%
-#   group_by(trust_index) %>%
-#   summarise(
-#     p_hat = mean(phat, na.rm = TRUE),
-#     n     = n(),
-#     # binomial SE for a mean proportion (simple, fine for plotting):
-#     se    = sqrt(p_hat * (1 - p_hat) / n),
-#     lower = p_hat - 1.96 * se,
-#     upper = p_hat + 1.96 * se,
-#     .groups = "drop"
-  )
+wald(m_logit)
 ```
 
 ```{r}
+#| message: false 
+#| warning: false 
 
 # baseline RHS: density + other controls, no trust
 rhs_base   <- c(density_var, ctrls)
@@ -389,7 +423,7 @@ run_trust_model <- function(trust_var) {
   )
 }
 
-trust_results <- map_dfr(trust_predictors, run_trust_model)
+#trust_results <- map_dfr(trust_predictors, run_trust_model)
 
 # order by extra explanatory power
 trust_results %>%
@@ -429,17 +463,6 @@ ggplot(trust_results_labeled, aes(x = trust_label, y = or)) +
   ) +
   theme_minimal()
 
-
-ggplot(trust_results, aes(x = trust_var, y = d_pr2)) +
-  geom_col() +
-  coord_flip() +
-  labs(
-    x = NULL,
-    y = "Δ pseudo-R² vs. baseline (no trust)",
-    title = "Which trust items add the most explanatory power?"
-  ) +
-  theme_minimal()
-#shift share analysis
-
 ```
-jdanfldhjfa;kdj
+
+make a diagram, stuff you're tryign to link, spatial and temporal detail sof your dataset. if you have trust in governemnt
