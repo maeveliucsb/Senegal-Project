@@ -1,0 +1,313 @@
+---
+title: "new regressions-endogenous?"
+author: "maeve"
+format: html
+editor: visual
+---
+
+```{r}
+#| message: false 
+#| warning: false 
+
+
+library(haven)
+library(tidyverse) 
+library(sf) 
+library(here) 
+library(stars) 
+library(tmap) 
+library(viridis) 
+library(readr)
+library(dplyr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(lubridate)
+library(terra)
+library(exactextractr)
+library(readr)
+library(fuzzyjoin)
+
+#remotes::install_github("wmgeolab/rgeoboundaries") #admin level shape files, which lets you download the rgeoboundaries package
+library(rgeoboundaries)
+sf_use_s2(FALSE)  # turn off s2 for polygon ops; avoids the "Loop 0 is not valid" error
+
+
+```
+Acled
+```{r}
+acled <- sf::st_read(here::here("ACLEDnew.csv")) %>%
+  mutate(
+    latitude   = as.numeric(latitude),
+    longitude  = as.numeric(longitude),
+    event_date = lubridate::ymd(event_date),
+    year       = lubridate::year(event_date)
+  ) %>%
+  filter(
+    !is.na(latitude), !is.na(longitude),
+    between(latitude, -90, 90),
+    between(longitude, -180, 180),
+    year >= 2015, year <= 2025   # pick a reasonable window
+  )
+
+acled_sf <- st_as_sf(acled, coords = c("longitude", "latitude"),
+                     crs = 4326, remove = FALSE) %>%
+  st_transform(st_crs(admin_sf)) %>%
+  st_make_valid()
+#giving the conflict data geometry
+# names(acled)[grep("lat|lon|long", names(acled), ignore.case = TRUE)]
+# 
+# lat_col <- "latitude"
+# lon_col <- "longitude"
+# 
+# # Ensure numeric & sane values
+# acled <- acled %>%
+#   mutate(
+#     !!lat_col := as.numeric(.data[[lat_col]]),
+#     !!lon_col := as.numeric(.data[[lon_col]])
+#   ) %>%
+#   filter(!is.na(.data[[lat_col]]), !is.na(.data[[lon_col]]),
+#          between(.data[[lat_col]], -90, 90),
+#          between(.data[[lon_col]], -180, 180))
+# 
+# # 5) Make sf POINTS (WGS84)
+# acled_sf <- st_as_sf(acled, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
+# 
+# 
+# west_af <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") |>
+#   filter(subregion == "Western Africa") |>
+#   st_transform(st_crs(acled_sf)) |>
+#   st_make_valid()
+# 
+# acled_wa <- acled_sf |>
+#   st_make_valid() |>
+#   st_intersection(st_union(st_geometry(west_af)))
+
+```
+
+data and codebooks: https://www.afrobarometer.org/data/merged-data/
+
+Trust items - police, - local governance (traditional leaders and informal institutions), - courts of law, - opposition parties, and - electoral commissions R5 (saved for robustness checks)-too weird: - police (Q59H) - local governance (not included) - courts of law (Q59J) - opposition parties, and (not included) - electoral commissions (not included) - region (region) - country (COUNTRY) R6: - Police (Q52H) - local governance (Q52K) - courts of law, (Q52J) - opposition parties, and (Q52G) \*no bf data - electoral commissions (Q52C) - region (REGION) - country (COUNTRY)
+
+R7: - Police (Q43G) - local governance (Q43J) - courts of law, (Q43I) - opposition parties, and (Q43F) \*no bf data - electoral commissions (Q43C) - region (REGION) - country (COUNTRY)
+
+R8: - Police (Q41G) - local governance (Q41K) - courts of law, (Q41I) - opposition parties, and (Q41F) \*no bf data - electoral commissions (Q41C) - region (REGION) - country (COUNTRY)
+
+R9: - Police (Q37G) - local governance (Q37J) - courts of law, (Q37I) - opposition parties, and (Q37F) \*no bf data - electoral commissions (Q37C) - region (REGION) - country (COUNTRY)
+
+#### Afrobarometer
+
+```{r}
+ab5 <- read_sav('Abdata/ABR52015-2011.sav')
+ab6 <- read_sav("Abdata/ABR62016.sav", encoding = "latin1")
+ab7 <- read_sav('Abdata/ABR72019.sav')
+ab8 <- read_sav('Abdata/ABR82022.sav')
+ab9 <- read_sav('Abdata/ABR92023.sav')
+```
+
+recoding everythign to be 1-4 not 0-3, easier to work with. dropping NAs
+
+```{r}
+recode_trust_1_4 <- function(x) {
+  case_when(
+    x %in% 0:3 ~ as.numeric(x) + 1,
+    TRUE       ~ NA_real_
+  )
+}
+```
+
+####### making a function
+
+which takes what i'm looking for and renames it so i can work with it across datasets
+
+```{r}
+clean_ab_round <- function(df,
+                           round_number,
+                           police_var,
+                           local_var,
+                           courts_var,
+                           opp_var,
+                           elec_var,
+                           country_var = "COUNTRY",
+                           region_var  = "REGION", 
+                           Urb_rur = "URBRUR") {
+  
+  df %>%
+    transmute(
+      round   = round_number,
+      country = haven::as_factor(.data[[country_var]]),
+      region  = haven::as_factor(.data[[region_var]]),
+      # years are fixed per merged file; avoids INTDATE headaches
+      year    = dplyr::case_when(
+        round_number == 6 ~ 2016L,
+        round_number == 7 ~ 2019L,
+        round_number == 8 ~ 2022L,
+        round_number == 9 ~ 2023L,
+        TRUE              ~ NA_integer_
+      ),
+      police_raw = .data[[police_var]],
+      local_raw  = .data[[local_var]],
+      courts_raw = .data[[courts_var]],
+      opp_raw    = .data[[opp_var]],
+      elec_raw   = .data[[elec_var]], 
+    ) %>%
+    mutate(
+      across(
+        ends_with("_raw"),
+        recode_trust_1_4,
+        .names = "{.col}_1_4"
+      ),
+      # 5-item institutional trust index (police, local gov, courts, opp parties, electoral commission)
+      trust_index = rowMeans(
+        cbind(
+          police_raw_1_4,
+          local_raw_1_4,
+          courts_raw_1_4,
+          opp_raw_1_4,
+          elec_raw_1_4
+        ),
+        na.rm = TRUE
+      ),
+      # admin unit identifier (country × region)
+      admin_id = interaction(country, region, drop = TRUE)
+    )
+}
+```
+
+applying the function
+
+```{r}
+# R6 (2016)
+ab6_clean <- clean_ab_round(
+  df           = ab6,
+  round_number = 6,
+  police_var   = "Q52H",
+  local_var    = "Q52K",
+  courts_var   = "Q52J",
+  opp_var      = "Q52G",
+  elec_var     = "Q52C",
+)
+
+# R7 (2019)
+ab7_clean <- clean_ab_round(
+  df         = ab7,
+  round_number = 7,
+  police_var = "Q43G",
+  local_var  = "Q43J",
+  courts_var = "Q43I",
+  opp_var    = "Q43F",
+  elec_var   = "Q43C"
+)
+
+# R8 (2022)
+ab8_clean <- clean_ab_round(
+  df         = ab8,
+  round_number = 8,
+  police_var = "Q41G",
+  local_var  = "Q41K",
+  courts_var = "Q41I",
+  opp_var    = "Q41F",
+  elec_var   = "Q41C"
+)
+
+# R9 (2023)
+ab9_clean <- clean_ab_round(
+  df         = ab9,
+  round_number = 9,
+  police_var = "Q37G",
+  local_var  = "Q37J",
+  courts_var = "Q37I",
+  opp_var    = "Q37F",
+  elec_var   = "Q37C"
+)
+
+```
+
+####### Restricting to WA
+
+```{r}
+survey_all <- bind_rows(
+  ab6_clean,
+  ab7_clean,
+  ab8_clean,
+  ab9_clean
+)
+view(survey_all)
+
+#filtering to WA-make sure to check the countries, haven't done that yet
+west_africa <- c(
+  "Benin", "Burkina Faso", "Cabo Verde", "Cape Verde",  # keep only the one you actually use
+  "Côte d'Ivoire", "Ivory Coast",                       # same here
+  "Gambia", "Ghana", "Guinea", "Guinea-Bissau",
+  "Liberia", "Mali", "Mauritania", "Niger", "Nigeria",
+  "Senegal", "Sierra Leone", "Togo"
+)
+survey_all <- survey_all %>%
+  filter(country %in% west_africa_countries)
+
+```
+
+```{r}
+
+trust_vars_raw <- c(
+  "police_raw_1_4",
+  "local_raw_1_4",
+  "courts_raw_1_4",
+  "opp_raw_1_4",
+  "elec_raw_1_4",
+  "trust_index"
+)
+trust_vars <- trust_vars_raw[trust_vars_raw %in% names(survey_all)]
+if (length(trust_vars) == 0) {
+  stop("None of the trust_vars_raw are in ab_all_clean. Fix the names.")
+}
+trust_vars
+```
+
+# doing somethign with urban/rural
+
+```{r}
+table(survey_all$URBRUR, useNA = "ifany")
+
+ab_all_clean <- survey_all %>%
+  mutate(
+    urbrur_cat = case_when(
+      URBRUR == 1 ~ "Urban",
+      URBRUR == 2 ~ "Rural",
+      URBRUR == 3 ~ "Semi-Urban",
+      URBRUR == 460 ~ "Peri-Urban",
+      TRUE ~ NA_character_
+    ),
+    urbrur_cat = factor(
+      urbrur_cat,
+      levels = c("Rural", "Semi-Urban", "Peri-Urban", "Urban")
+    )
+  )
+
+table(survey_all$urbrur_cat, useNA = "ifany")
+```
+
+# aggregating to the country year level
+```{r}
+trust_panel_country <- ab_all_clean %>%
+  filter(country %in% west_africa) %>%   # adjust to your country variable name
+  group_by(country, year) %>%
+  summarise(
+    # weighted mean trust for each item
+    across(
+      all_of(trust_vars),
+      ~ weighted.mean(.x, w = weight, na.rm = TRUE),
+      .names = "mean_{.col}"
+    ),
+    # weighted proportion urban
+    urban_share = weighted.mean(is_urban, w = weight, na.rm = TRUE),
+    n_resp      = n(),
+    .groups     = "drop"
+  )
+names(ab_all_clean)
+summary(trust_panel_country$urban_share)
+
+```
+
+
+
+
