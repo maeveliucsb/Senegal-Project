@@ -1,0 +1,573 @@
+---
+title: "gridcell-attempt"
+format: html
+editor: visual
+---
+#libraries
+
+```{r}
+
+#| message: false 
+#| warning: false 
+
+library(terra)
+library(rnaturalearth)
+library(dplyr)
+library(viridisLite)
+library(fixest)
+library(tidyverse) 
+library(sf) 
+library(here) 
+library(stars) 
+library(tmap) 
+library(viridis) 
+library(readr)
+library(dplyr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(lubridate)
+library(terra)
+library(exactextractr)
+library(readr)
+library(haven)
+library(sf)
+library(units)
+library(car)
+```
+
+#reading it in
+
+```{r}
+#| message: false 
+#| warning: false 
+ab <- read_sav("ABdata/R9Geo.sav")
+glbl <- rast("Popdata/Global.tif")
+acled <- sf::st_read(here::here("ACLEDnew.csv")) #its giving a warning that it's not spatial, thats ok i know
+names(acled)[grep("lat|lon|long", names(acled), ignore.case = TRUE)]
+
+lat_col <- "latitude"
+lon_col <- "longitude"
+acled <- acled %>%
+  mutate(
+    !!lat_col := as.numeric(.data[[lat_col]]),
+    !!lon_col := as.numeric(.data[[lon_col]])
+  ) %>%
+  filter(!is.na(.data[[lat_col]]), !is.na(.data[[lon_col]]),
+         between(.data[[lat_col]], -90, 90),
+         between(.data[[lon_col]], -180, 180))
+acled_sf <- st_as_sf(acled, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
+```
+####### Cropping to WA
+```{r}
+#| message: false 
+#| warning: false 
+africa <- ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
+# 3. Filter for your West African countries
+wa_countries <- africa %>%
+  dplyr::filter(admin %in% c(
+    "Benin", "Burkina Faso", "Cabo Verde", "Ivory Coast",
+    "Gambia", "Ghana", "Guinea", "Guinea Bissau", "Liberia", "Mali", "Mauritania", "Niger",
+    "Nigeria", "Senegal", "Sierra Leone", "Togo"
+  ))
+wa_v <- vect(wa_countries)
+
+# 5. Crop and mask the raster
+glbl_wa <- crop(glbl, wa_v)
+glbl_wa <- mask(glbl_wa, wa_v)
+
+# 6. Plot result
+plot(glbl_wa)
+```
+
+
+####### Cropping to WA
+
+```{r}
+#| message: false 
+#| warning: false 
+africa <- ne_countries(continent = "Africa", scale = "medium", returnclass = "sf")
+# 3. Filter for your West African countries
+wa_countries <- africa %>%
+  dplyr::filter(admin %in% c(
+    "Benin", "Burkina Faso", "Cabo Verde", "Ivory Coast",
+    "Gambia", "Ghana", "Guinea", "Guinea Bissau", "Liberia", "Mali", "Mauritania", "Niger",
+    "Nigeria", "Senegal", "Sierra Leone", "Togo"
+  ))
+wa_v <- vect(wa_countries)
+
+# 5. Crop and mask the raster
+glbl_wa <- crop(glbl, wa_v)
+glbl_wa <- mask(glbl_wa, wa_v)
+
+# 6. Plot result
+plot(glbl_wa)
+```
+
+#configuring for regressions
+
+```{r}
+#| message: false 
+#| warning: false 
+guess_coord <- function(df){
+  nms <- names(df)
+  lat_guess <- nms[grep("EA_GPS_LA", nms, ignore.case = TRUE)][1]
+  lon_guess <- nms[grep("EA_GPS_LO", nms, ignore.case = TRUE)][1]
+  stopifnot(!is.na(lon_guess), !is.na(lat_guess))
+  list(lon = lon_guess, lat = lat_guess)
+}
+xy <- guess_coord(ab)
+#names(ab)
+
+ab_sf <- ab %>%
+  mutate(
+    !!xy$lon := as.numeric(.data[[xy$lon]]),
+    !!xy$lat := as.numeric(.data[[xy$lat]])
+  ) %>%
+  filter(
+    between(.data[[xy$lat]], -90, 90),
+    between(.data[[xy$lon]], -180, 180)
+  ) %>%
+  st_as_sf(coords = c(xy$lon, xy$lat), crs = 4326, remove = FALSE)
+
+#n  = 53444
+```
+
+population density
+
+```{r}
+#| message: false 
+#| warning: false 
+# --------------------------------------
+# 3) Population density at respondent
+#     (convert counts -> per km²)
+# --------------------------------------
+# If Global.tif is population *counts per cell*, convert to density:
+cell_km2 <- terra::cellSize(glbl, unit = "km")
+pop_dens <- glbl / cell_km2   # persons per km²
+
+# Extract density for each AB point
+# terra::extract() works with sf; returns a data.frame with ID + values
+ab_sf$pop_density <- terra::extract(pop_dens, ab_sf)[, 2]
+
+# Optional: cap huge outliers & log-scale for stability
+ab_sf <- ab_sf %>%
+  mutate(pop_density_log = log1p(pmin(pop_density, quantile(pop_density, 0.99, na.rm = TRUE))))
+
+dist_25km <- set_units(25, km)
+
+within_25km <- st_is_within_distance(
+  ab_sf,
+  acled_sf,
+  dist = dist_25km
+)
+
+within_25km <- st_is_within_distance(ab_sf, acled_sf, dist = set_units(25, "km"))
+conflict_counts <- lengths(within_25km)
+
+ab_sf <- ab_sf %>%
+  mutate(
+    conflict_count     = conflict_counts,
+    conflict_presence  = conflict_counts > 0
+  )
+
+```
+
+actually working with the questions
+
+```{r}
+q37j_raw <- ab$Q37J
+
+# Drop special missing codes
+bad_codes <- c(8, 9, -1)
+q37j_raw[q37j_raw %in% bad_codes] <- NA
+
+# Now this is already 0–3
+trust_trad_leaders <- q37j_raw
+
+q37j_raw <- ab$Q37J
+q37j_raw[q37j_raw %in% c(8, 9, -1)] <- NA
+#trust_trad_leaders <- make_trust_0_3(q37j_raw)
+
+```
+
+```{r}
+make_trust_0_3 <- function(x) {
+  # convert to numeric if labelled/factor
+  x_num <- suppressWarnings(as.numeric(x))
+
+  # missing / special codes to NA
+  x_num[x_num %in% c(8, 9, 98, 99, -1, -2)] <- NA
+
+  # if everything is NA, just return NAs
+  if (all(is.na(x_num))) return(x_num)
+
+  rng <- range(x_num, na.rm = TRUE)
+
+  # 0–3: already on target scale
+  if (rng[1] >= 0 && rng[2] <= 3) {
+    out <- x_num
+
+  # 1–4: shift down by 1
+  } else if (rng[1] >= 1 && rng[2] <= 4) {
+    out <- x_num - 1
+
+  # anything else: leave as is, then clean
+  } else {
+    out <- x_num
+  }
+
+  # enforce 0–3 support
+  out[!is.na(out) & !(out %in% 0:3)] <- NA_real_
+
+  out
+}
+
+```
+
+Mkaing an index
+
+```{r}
+#| message: false 
+#| warning: false 
+#creating an index
+trust_candidates <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37D')
+#trust_corrpution <- c("Q37J", "Q37I", 'Q37F', 'Q37C', 'Q37B', 'Q37D', 'Q37K', 'Q37I', "Q38D", "Q38E", "Q38F", "Q38G", "Q38H")
+trust_cols <- trust_candidates[trust_candidates %in% names(ab_sf)]
+if (length(trust_cols) == 0) {
+  stop("Couldn't find any trust variables. Add their names to 'trust_candidates'.")
+}
+
+ab_sf <- ab_sf %>%
+  mutate(
+    across(
+      all_of(trust_cols),
+      make_trust_0_3,
+      .names = "{.col}_0_3"
+    )
+  )
+#trust_corr <- trust_corrpution[trust_corrpution %in% names(ab_sf)]
+#if (length(trust_corr) == 0) {
+#  stop("Couldn't find any trust variables. Add their names to 'trust_candidates'.")
+
+ab_sf <- ab_sf %>%
+  mutate(
+    across(
+      all_of(trust_cols),
+      make_trust_0_3,
+      .names = "{.col}_0_3"
+    )
+  )
+
+
+trust_index_cols <- paste0(trust_cols, "_0_3")
+
+ab_sf <- ab_sf %>%
+  rowwise() %>%
+  mutate(
+    trust_index = if_else(
+      # require at least 2 non-missing items (you can change this)
+      sum(!is.na(c_across(all_of(trust_index_cols)))) >= 2,
+      mean(c_across(all_of(trust_index_cols)), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup()
+
+
+# controls
+ctrls <- intersect(c("Q1", "Q2", "URBRUR", "Q100", "Q94", "Q95"), names(ab_sf))
+# Country/region FEs if present
+fe_country <- intersect(c("country", "country_name", "COUNTRY"), names(ab_sf))[1]
+fe_region  <- intersect(c("region", "region_name", "ADM1NAME"), names(ab_sf))[1]
+
+
+```
+
+```{r}
+#| message: false 
+#| warning: false 
+density_var <- if ("pop_density" %in% names(ab_sf)) {
+  "pop_density"
+} else if ("pop_density_log" %in% names(ab_sf)) {
+  "pop_density_log"
+} else {
+  stop("No population density variable found (pop_density or pop_density_log).")
+}
+
+
+# main regressors: trust + density + other controls
+rhs_vars <- c("trust_index", density_var, ctrls)
+
+# collapse into a single RHS string: e.g. "trust_index + pop_density + Q1 + Q2 + URBRUR + ..."
+rhs_str <- paste(rhs_vars, collapse = " + ")
+
+# Start with the basic part: DV ~ regressors
+base_str <- paste0("conflict_presence ~ ", rhs_str)
+
+# Build FE part depending on what exists
+fe_part <- NULL
+
+if (!is.na(fe_country) && !is.na(fe_region)) {
+  fe_part <- paste(fe_country, fe_region, sep = " + ")
+} else if (!is.na(fe_region)) {
+  fe_part <- fe_region
+} else if (!is.na(fe_country)) {
+  fe_part <- fe_country
+}
+
+# Combine into final formula string
+if (!is.null(fe_part)) {
+  # fixest syntax: y ~ x1 + x2 | fe1 + fe2
+  f_str <- paste(base_str, "|", fe_part)
+} else {
+  # no FEs available
+  f_str <- base_str
+}
+
+f_logit <- as.formula(f_str)
+f_logit
+
+
+
+```
+#models
+```{r}
+```{r}
+#| message: false 
+#| warning: false 
+library(fixest)
+
+m_logit <- feglm(
+  fml    = f_logit,
+  data   = ab_sf,
+  family = "binomial"
+)
+
+summary(m_logit)
+library(stargazer)
+
+ct <- summary(m_logit)$coeftable
+# columns: "Estimate" "Std. Error" "z value" "Pr(>|z|)"
+
+coefs <- ct[, "Estimate"]
+ses   <- ct[, "Std. Error"]
+pvals <- ct[, "Pr(>|z|)"]
+
+# make sure output dir exists
+if (!dir.exists("Outputs")) dir.create("Outputs")
+
+# Drop geometry so glm doesn't choke on the sf column
+dat <- st_drop_geometry(ab_sf)
+
+# Use the same FE variable you already detected (fe_country)
+# (If fe_country is NA, this will error—good, because it means you don't have a country column.)
+stopifnot(!is.na(fe_country))
+
+m1 <- glm(
+  reformulate(
+    c("trust_index", density_var, ctrls, paste0("factor(", fe_country, ")")),
+    response = "conflict_presence"
+  ),
+  data = dat,
+  family = binomial(link = "logit")
+)
+
+
+stargazer(
+  m1,
+  type = "latex",
+  title = "Logit estimates of conflict presence",
+  dep.var.labels = "Conflict presence (binary)",
+  omit = fe_country,  # omits all factor(COUNTRY) dummy rows
+  add.lines = list(
+    c("Country fixed effects", "Yes")
+  ),
+  digits = 3,
+  no.space = TRUE
+)
+```
+#trust by gridcell
+```{r}
+library(sf)
+library(dplyr)
+
+# Choose an equal-area CRS so grid cell size in meters is meaningful
+crs_ea <- 6933  # World Cylindrical Equal Area (works fine for WA-scale summaries)
+
+# Transform WA polygon + AB points to equal-area
+wa_sf_ea  <- st_transform(wa_countries, crs_ea)
+ab_sf_ea  <- st_transform(ab_sf, crs_ea)
+
+# (optional but recommended) drop empty geometries / invalid
+wa_sf_ea  <- st_make_valid(wa_sf_ea)
+
+# Grid size in meters
+cell_km <- 75
+cell_m  <- cell_km * 1000
+
+# Build grid, then clip to WA (so you don't keep ocean cells)
+grid_ea <- st_make_grid(
+  wa_sf_ea,
+  cellsize = cell_m,
+  square   = TRUE
+) |>
+  st_as_sf() |>
+  mutate(cell_id = row_number())
+
+# Keep only cells that intersect West Africa
+wa_union <- st_union(wa_sf_ea)
+grid_wa  <- grid_ea[st_intersects(grid_ea, wa_union, sparse = FALSE), ]
+
+
+# Join cell_id onto each AB point (left join: keep all AB points)
+ab_with_cell <- st_join(
+  ab_sf_ea,
+  grid_wa[, c("cell_id")],
+  join = st_within,
+  left = TRUE
+)
+ab_with_cell <- ab_with_cell |>
+  mutate(cell_id = cell_id.y) |>
+  select(-cell_id.x, -cell_id.y)
+
+trust_by_cell <- ab_with_cell |>
+  st_drop_geometry() |>
+  group_by(cell_id) |>
+  summarise(
+    n_resp          = sum(!is.na(trust_index)),
+    trust_mean      = mean(trust_index, na.rm = TRUE),
+    trust_sd        = sd(trust_index, na.rm = TRUE),
+    popdens_mean    = mean(pop_density, na.rm = TRUE),
+    conflict_any_sh = mean(conflict_presence, na.rm = TRUE)  # share of respondents in cell w/ conflict within 25km
+  ) |>
+  ungroup()
+
+# Attach summaries back onto the grid polygons
+grid_trust <- grid_wa |>
+  left_join(trust_by_cell, by = "cell_id")
+c(
+  x_na = mean(is.na(ab_with_cell$cell_id.x)),
+  y_na = mean(is.na(ab_with_cell$cell_id.y))
+)
+
+trust_by_cell <- ab_with_cell |>
+  st_drop_geometry() |>
+  group_by(cell_id) |>
+  summarise(
+    n_resp          = sum(!is.na(trust_index)),
+    trust_mean      = mean(trust_index, na.rm = TRUE),
+    trust_sd        = sd(trust_index, na.rm = TRUE),
+    popdens_mean    = mean(pop_density, na.rm = TRUE),
+    conflict_any_sh = mean(conflict_presence, na.rm = TRUE)  # share of respondents in cell w/ conflict within 25km
+  ) |>
+  ungroup()
+
+# Attach summaries back onto the grid polygons
+grid_trust <- grid_wa |>
+  left_join(trust_by_cell, by = "cell_id")
+```
+##map
+```{r}
+library(tmap)
+
+tm_shape(grid_trust) +
+  tm_polygons(
+    col = "trust_mean",
+    style = "cont",
+    title = paste0("Mean trust index (", cell_km, "km cells)")
+  ) +
+  tm_layout(frame = FALSE)
+```
+#conflict by grid cell
+```{r}
+library(lubridate)
+library(sf)
+library(dplyr)
+
+# If your date col isn't event_date, change it here:
+date_col <- "event_date"
+
+acled_2020_2024 <- acled_sf %>%
+  mutate(event_date = as.Date(.data[[date_col]])) %>%   # if already Date, this is fine
+  filter(event_date >= as.Date("2020-01-01"),
+         event_date <= as.Date("2024-12-31"))
+
+# project to same CRS as grid
+acled_ea <- st_transform(acled_2020_2024, crs_ea)
+
+acled_with_cell <- st_join(
+  acled_ea |> dplyr::select(-any_of("cell_id")),              # drop any existing cell_id
+  grid_wa  |> dplyr::select(cell_id) |> rename(grid_cell = cell_id),
+  join = st_within,
+  left = FALSE
+)
+
+conflict_by_cell <- acled_with_cell %>%
+  st_drop_geometry() %>%
+  count(grid_cell, name = "conflict_events_2020_2024") %>%
+  mutate(conflict_avg_annual_2020_2024 = conflict_events_2020_2024 / 5)
+
+grid_conflict <- grid_wa %>%
+  rename(grid_cell = cell_id) %>%
+  left_join(conflict_by_cell, by = "grid_cell") %>%
+  mutate(
+    conflict_events_2020_2024 = tidyr::replace_na(conflict_events_2020_2024, 0),
+    conflict_avg_annual_2020_2024 = tidyr::replace_na(conflict_avg_annual_2020_2024, 0)
+  )
+```
+##map
+```{r}
+library(tmap)
+
+tm_shape(grid_conflict) +
+  tm_polygons(col = "conflict_avg_annual_2020_2024",
+              style = "cont",
+              title = "Avg annual conflict events (2020–2024)") +
+  tm_layout(frame = FALSE)
+
+```
+
+#trustxconflict
+```{r}
+# Make trust grid use the same id name as conflict grid
+grid_trust2 <- grid_trust %>%
+  rename(grid_cell = cell_id)
+
+# Join trust onto the conflict grid (or vice versa)
+grid_analysis <- grid_conflict %>%
+  left_join(
+    grid_trust2 %>% st_drop_geometry() %>%
+      select(grid_cell, n_resp, trust_mean, trust_sd, popdens_mean),
+    by = "grid_cell"
+  )
+
+# Optional but smart: drop cells with too few AB respondents
+min_n <- 0
+grid_analysis <- grid_analysis %>%
+  mutate(trust_mean = ifelse(n_resp >= min_n, trust_mean, NA_real_))
+
+library(MASS)
+
+df <- grid_analysis %>%
+  st_drop_geometry() %>%
+  filter(!is.na(trust_mean))
+
+m_nb <- MASS::glm.nb(
+  conflict_events_2020_2024 ~ trust_mean + log1p(popdens_mean),
+  data = df
+)
+
+summary(m_nb)
+
+df <- grid_analysis %>%
+  mutate(cell_area_km2 = as.numeric(st_area(geometry)) / 1e6) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(trust_mean))
+
+m_nb_area <- MASS::glm.nb(
+  conflict_events_2020_2024 ~ trust_mean + log1p(popdens_mean) + log(cell_area_km2),
+  data = df
+)
+
+summary(m_nb_area)
+```
