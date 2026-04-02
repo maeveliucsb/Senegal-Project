@@ -1,0 +1,423 @@
+---
+title: "Gridcells"
+author: "Maeve Li Oak"
+format: html
+editor: visual
+---
+
+#packages
+```{r}
+#reading libraries
+library(tidyverse) 
+library(sf) 
+library(here) 
+library(stars) 
+library(tmap) 
+library(viridis) 
+library(readr)
+library(dplyr)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(lubridate)
+library(terra)
+library(exactextractr)
+library(readr)
+library(fixest)
+```
+
+#reading in data
+```{r}
+#population-this one is big and takes forever...just know that in your spirit as you move forward
+pop_rast <- terra::rast(here::here("popdata", "Global.tif"))
+pop_ea <- terra::project(pop_rast, paste0("EPSG:", crs_ea))
+#afrobarometer
+r6 <- sf::st_read(here::here("requestedAB", "Maeve_r6.csv")) 
+r7 <- haven::read_sav(here::here("requestedAB", "Maeve_r7.sav"))
+r8 <- haven::read_sav(here::here("requestedAB", "Maeve_r8.sav"))
+r9 <- haven::read_sav(here::here("ABdata/R9Geo.sav"))
+
+#acled
+acled <- sf::st_read(here::here("ACLEDnew.csv")) 
+names(acled)[grep("lat|lon|long", names(acled), ignore.case = TRUE)]
+
+lat_col <- "latitude"
+lon_col <- "longitude"
+
+# Ensure numeric & sane values
+acled <- acled %>%
+  mutate(
+    !!lat_col := as.numeric(.data[[lat_col]]),
+    !!lon_col := as.numeric(.data[[lon_col]])
+  ) %>%
+  filter(!is.na(.data[[lat_col]]), !is.na(.data[[lon_col]]),
+         between(.data[[lat_col]], -90, 90),
+         between(.data[[lon_col]], -180, 180))
+
+acled_sf <- st_as_sf(acled, coords = c(lon_col, lat_col), crs = 4326, remove = FALSE)
+```
+
+
+```{r}
+#making a basemap----
+west_af <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") |>
+  filter(subregion == "Western Africa") |>
+  st_transform(st_crs(acled_sf)) |>
+  st_make_valid()
+
+acled_wa <- acled_sf |>
+  st_make_valid() |>
+  st_intersection(st_union(st_geometry(west_af)))
+
+tmap_mode("view")
+
+```
+building grid
+```{r}
+crs_ea <- 6933
+cell_km <- 75
+cell_m  <- cell_km * 1000
+
+west_af_ea <- st_transform(west_af, crs_ea)
+wa_union_ea <- st_union(st_geometry(west_af_ea))
+
+grid_ea <- st_make_grid(
+  wa_union_ea,
+  cellsize = cell_m,
+  square = TRUE
+) %>%
+  st_as_sf() %>%
+  mutate(cell_id = row_number()) %>%
+  st_intersection(wa_union_ea)
+
+grid <- st_transform(grid_ea, 4326)
+```
+
+#helper function
+```{r}
+recode_ab_trust <- function(x) {
+  x <- as.numeric(x)
+  x[x %in% c(-1, 8, 9, 98, 99)] <- NA
+  return(x)
+}
+```
+
+#round 6
+```{r}
+prep_r6 <- function(df) {
+  df %>%
+    mutate(
+      round = 6,
+      survey_year = 2016,
+      trust_president    = recode_ab_trust(q52a),
+      trust_parliament   = recode_ab_trust(q52b),
+      trust_electoral    = recode_ab_trust(q52c),
+      trust_tax          = recode_ab_trust(q52d),
+      trust_localgov     = recode_ab_trust(q52e),
+      trust_rulingparty  = recode_ab_trust(q52f),
+      trust_opposition   = recode_ab_trust(q52g),
+      trust_police       = recode_ab_trust(q52h),
+      trust_army         = recode_ab_trust(q52i),
+      trust_courts       = recode_ab_trust(q52j),
+      trust_traditional  = recode_ab_trust(q52k),
+      trust_religious    = recode_ab_trust(q52l),
+      age = as.numeric(q1),
+      gender = as.numeric(q101),
+      ethnicity = as.character(q87),
+      ethnic_unfair = as.numeric(q88a),
+      religion = as.character(q98a),
+      lon = as.numeric(longitude),
+      lat = as.numeric(latitude)
+    ) %>%
+    select(round, survey_year, lon, lat, age, gender, ethnicity, ethnic_unfair, religion,
+           starts_with("trust_"))
+}
+```
+#round 7
+```{r}
+prep_r7 <- function(df) {
+  df %>%
+    mutate(
+      round = 7,
+      survey_year = 2020,   # adjust if needed
+      trust_president    = recode_ab_trust(Q43A),
+      trust_parliament   = recode_ab_trust(Q43B),
+      trust_electoral    = recode_ab_trust(Q43C),
+      trust_localgov     = recode_ab_trust(Q43D),
+      trust_rulingparty  = recode_ab_trust(Q43E),
+      trust_opposition   = recode_ab_trust(Q43F),
+      trust_police       = recode_ab_trust(Q43G),
+      trust_army         = recode_ab_trust(Q43H),
+      trust_courts       = recode_ab_trust(Q43I),
+      trust_traditional  = recode_ab_trust(Q43J),
+      trust_religious    = recode_ab_trust(Q43K),
+      age = as.numeric(Q1),
+      gender = as.numeric(Q101),
+      ethnicity = as.character(Q84),
+      ethnic_unfair = as.numeric(Q85A),
+      religion = as.character(Q98),
+      lon = as.numeric(EA_GPS_LO),
+      lat = as.numeric(EA_GPS_LA)
+    ) %>%
+    select(round, survey_year, lon, lat, age, gender, ethnicity, ethnic_unfair, religion,
+           starts_with("trust_"))
+}
+```
+
+#round 8
+```{r}
+prep_r8 <- function(df) {
+  df %>%
+    mutate(
+      round = 8,
+      survey_year = 2022,   # adjust if needed
+      trust_president    = recode_ab_trust(Q41A),
+      trust_parliament   = recode_ab_trust(Q41B),
+      trust_electoral    = recode_ab_trust(Q41C),
+      trust_localgov     = recode_ab_trust(Q41D),
+      trust_rulingparty  = recode_ab_trust(Q41E),
+      trust_opposition   = recode_ab_trust(Q41F),
+      trust_police       = recode_ab_trust(Q41G),
+      trust_army         = recode_ab_trust(Q41H),
+      trust_courts       = recode_ab_trust(Q41I),
+      trust_tax          = recode_ab_trust(Q41J),
+      trust_traditional  = recode_ab_trust(Q41K),
+      trust_religious    = recode_ab_trust(Q41L),
+      age = as.numeric(Q1),
+      gender = as.numeric(Q101),
+      ethnicity = as.character(Q81),
+      ethnic_unfair = as.numeric(Q82A),
+      religion = as.character(Q98A),
+      lon = as.numeric(EA_GPS_LO),
+      lat = as.numeric(EA_GPS_LA)
+    ) %>%
+    select(round, survey_year, lon, lat, age, gender, ethnicity, ethnic_unfair, religion,
+           starts_with("trust_"))
+}
+```
+
+#round 9
+```{r}
+prep_r9 <- function(df) {
+  df %>%
+    mutate(
+      round = 9,
+      survey_year = 2023,
+      trust_president    = recode_ab_trust(Q37A),
+      trust_parliament   = recode_ab_trust(Q37B),
+      trust_electoral    = recode_ab_trust(Q37C),
+      trust_localgov     = recode_ab_trust(Q37D),
+      trust_rulingparty  = recode_ab_trust(Q37E),
+      trust_opposition   = recode_ab_trust(Q37F),
+      trust_police       = recode_ab_trust(Q37G),
+      trust_army         = recode_ab_trust(Q37H),
+      trust_courts       = recode_ab_trust(Q37I),
+      trust_traditional  = recode_ab_trust(Q37J),
+      trust_religious    = recode_ab_trust(Q37K),
+      age = as.numeric(Q1),
+      gender = as.numeric(Q101),
+      ethnicity = as.character(Q84A),
+      ethnic_unfair = as.numeric(Q88A),
+      religion = as.character(Q98A),
+      lon = as.numeric(EA_GPS_LO),
+      lat = as.numeric(EA_GPS_LA)
+    ) %>%
+    select(
+      round, survey_year, lon, lat, age, gender,
+      ethnicity, ethnic_unfair, religion,
+      starts_with("trust_")
+    )
+}
+```
+#population stuff
+```{r}
+grid_ea$pop_density <- exactextractr::exact_extract(
+  pop_ea,
+  grid_ea,
+  "mean"
+)
+#merging to panel
+grid_pop <- grid_ea %>%
+  st_drop_geometry() %>%
+  select(cell_id, pop_density)
+
+panel <- panel %>%
+  left_join(grid_pop, by = "cell_id")
+
+#loging density
+panel <- panel %>%
+  mutate(
+    log_pop_density = log1p(pop_density)
+  )
+
+```
+
+#stacking rounds
+```{r}
+ab_all <- bind_rows(
+  prep_r6(r6),
+  prep_r7(r7),
+  prep_r8(r8),
+  prep_r9(r9)
+) %>%
+  filter(
+    !is.na(lat), !is.na(lon),
+    between(lat, -90, 90),
+    between(lon, -180, 180)
+  )
+```
+
+#building trust index
+```{r}
+trust_vars <- c(
+  "trust_parliament",
+  "trust_electoral",
+  "trust_localgov",
+  "trust_opposition",
+  "trust_police",
+  "trust_army",
+  "trust_courts",
+  "trust_traditional",
+  "trust_religious"
+)
+
+ab_all <- ab_all %>%
+  mutate(
+    trust_n_nonmiss = rowSums(!is.na(across(all_of(trust_vars)))),
+    trust_index_raw = rowMeans(across(all_of(trust_vars)), na.rm = TRUE),
+    trust_index_raw = ifelse(trust_n_nonmiss >= 5, trust_index_raw, NA_real_)
+  ) %>%
+  group_by(round) %>%
+  mutate(
+    trust_index_z = as.numeric(scale(trust_index_raw))
+  ) %>%
+  ungroup()
+```
+#converting to SF and assigning cells
+```{r}
+ab_sf <- st_as_sf(ab_all, coords = c("lon", "lat"), crs = 4326, remove = FALSE) %>%
+  st_make_valid()
+
+ab_sf_ea <- st_transform(ab_sf, crs_ea)
+
+ab_with_cells <- st_join(ab_sf_ea, grid_ea["cell_id"], left = FALSE)
+```
+
+
+#aggregating to cell x round
+```{r}
+trust_cell_round <- ab_with_cells %>%
+  st_drop_geometry() %>%
+  group_by(cell_id, round, survey_year) %>%
+  summarise(
+    trust_cell = mean(trust_index_z, na.rm = TRUE),
+    trust_sd   = sd(trust_index_z, na.rm = TRUE),
+    n_resp     = n(),
+    mean_age   = mean(age, na.rm = TRUE),
+    prop_female = mean(gender == 2, na.rm = TRUE),  # adjust coding if needed
+    .groups = "drop"
+  ) %>%
+  filter(n_resp >= 5)
+```
+#ACLED to cell
+```{r}
+acled_ea <- st_transform(acled_wa, crs_ea)
+
+acled_with_cells <- st_join(acled_ea, grid_ea["cell_id"], left = FALSE)
+#making sure event_date is correct
+acled_with_cells <- acled_with_cells %>%
+  mutate(
+    event_date = suppressWarnings(lubridate::ymd(event_date)),
+    event_year = year(event_date)
+  )
+```
+
+#matching conflict to round
+```{r}
+round_year_lookup <- tibble(
+  round = c(6, 7, 8, 9),
+  survey_year = c(2016, 2020, 2022, 2023)
+)
+#counting conflict to cell x survey_year
+conflict_cell_round <- acled_with_cells %>%
+  st_drop_geometry() %>%
+  inner_join(round_year_lookup, by = c("event_year" = "survey_year")) %>%
+  group_by(cell_id, round, event_year) %>%
+  summarise(
+    conflict_events = n(),
+    conflict_any = as.integer(n() > 0),
+    .groups = "drop"
+  ) %>%
+  rename(survey_year = event_year)
+```
+
+#merging to analysis data
+```{r}
+panel <- trust_cell_round %>%
+  left_join(conflict_cell_round, by = c("cell_id", "round", "survey_year")) %>%
+  mutate(
+    conflict_events = replace_na(conflict_events, 0),
+    conflict_any    = replace_na(conflict_any, 0)
+  )
+```
+#CFEs
+
+```{r}
+grid_country <- st_join(
+  st_centroid(grid),
+  west_af %>% select(admin = admin),
+  left = FALSE
+) %>%
+  st_drop_geometry() %>%
+  select(cell_id, admin)
+
+panel <- panel %>%
+  left_join(grid_country, by = "cell_id")
+
+```
+
+#does trust predict conflict? with population
+```{r}
+m_logit_pop <- feglm(
+  conflict_any ~ trust_cell + log_pop_density + n_resp + mean_age + prop_female | admin + round,
+  data = panel,
+  family = binomial()
+)
+
+summary(m_logit_pop)
+
+```
+
+# log odds
+```{r}
+newdat <- data.frame(
+  trust_cell = seq(min(panel$trust_cell, na.rm = TRUE),
+                   max(panel$trust_cell, na.rm = TRUE),
+                   length.out = 100),
+  n_resp = median(panel$n_resp, na.rm = TRUE),
+  mean_age = median(panel$mean_age, na.rm = TRUE),
+  prop_female = median(panel$prop_female, na.rm = TRUE),
+  admin = names(sort(table(panel$admin), decreasing = TRUE))[1],
+  round = 9
+)
+
+newdat$pred <- predict(m_logit, newdata = newdat, type = "response")
+
+ggplot(newdat, aes(x = trust_cell, y = pred)) +
+  geom_line(linewidth = 1) +
+  theme_minimal() +
+  labs(
+    x = "Grid-cell trust",
+    y = "Predicted probability of any conflict",
+    title = "Predicted conflict probability by trust"
+  )
+```
+
+#does trust predict number of conflict events? 
+```{r}
+m_pois_pop <- fepois(
+  conflict_events ~ trust_cell + log_pop_density + n_resp + mean_age + prop_female | admin + round,
+  data = panel
+)
+
+summary(m_pois_pop)
+```
